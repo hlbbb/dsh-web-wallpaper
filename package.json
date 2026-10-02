@@ -33,5 +33,14 @@
       ]
     }
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hlbbb/dsh-web-wallpaper.git"
+  },
+  "homepage": "https://github.com/hlbbb/dsh-web-wallpaper#readme",
+  "bugs": {
+    "url": "https://github.com/hlbbb/dsh-web-wallpaper/issues"
+  },
+  "author": "hlbbb"
 }
