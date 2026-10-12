@@ -15,8 +15,40 @@ const file = process.argv[2];
 const DUMP = process.argv.includes("--dump");
 const src = fs.readFileSync(file, "utf8");
 
+/**
+ * ── 迁移哨兵值：从 client.js 源码动态提取（不要写死）──
+ *
+ * client.js 顶部有个一次性 migrate()：它以 localStorage["wwp_migrated"] 作为哨兵，
+ * 哨兵不等于当前期望值时就执行迁移，其中一句会把 mid / heavy 档位强制改写成 light。
+ * 检查器必须模拟「已经完成迁移、且用户确实选了 mid / heavy」的真实用户，否则
+ * 三档会被 migrate 全部压成 light，量到的是同一份 LEVELS.light 数值（假失败）。
+ *
+ * 写死哨兵值会随客户端升版静默失效，所以这里从源码提取。提取失败才回退默认值。
+ * 注意本仓库工具层的历史怪癖：避免在正则里使用带连字符的字符类（可能被吞）。
+ */
+const SENTINEL_FALLBACK = "4";
+function extractMigrationSentinel(source) {
+  // 只认形如  localStorage.getItem("wwp_migrated") === "4"  的读判定，
+  // 不会误匹配 setItem("wwp_migrated", "4")（那条没有 ")" 与 "==="）。
+  const re = new RegExp('wwp_migrated"\\s*\\)\\s*===\\s*"(\\d+)"');
+  const m = re.exec(source);
+  if (m) return { value: m[1], source: "从 client.js 提取" };
+  return { value: SENTINEL_FALLBACK, source: "回退默认（提取失败）" };
+}
+const SENTINEL = extractMigrationSentinel(src);
+if (SENTINEL.source.indexOf("回退") !== -1) {
+  console.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  console.log("!! 警告：未能从 " + file + " 提取 wwp_migrated 迁移哨兵值。");
+  console.log("!! 已回退到默认值 " + SENTINEL_FALLBACK + "，检查结果可能失真（档位或被测成同一档）。");
+  console.log("!! 请核对 client.js 里 migrate() 的哨兵判定写法。");
+  console.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+}
+
 const DARK_ATTR = "data" + HY + "ds" + HY + "dark" + HY + "theme";
 const SURFACE_ATTR = "data" + HY + "wwp" + HY + "surface";
+
+console.log("迁移哨兵值 wwp_migrated = " + SENTINEL.value + "（来源：" + SENTINEL.source + "）");
+console.log("");
 
 function makeClassList() {
   const set = new Set();
@@ -87,7 +119,9 @@ function runOnce(level, dark) {
   storage.set("wwp_surface_level", JSON.stringify(level));
   storage.set("wwp_surface", "true");
   storage.set("wwp_enabled", "true");
-  storage.set("wwp_migrated", "2");
+  // 预置「已完成迁移」的状态，与 client.js 当前哨兵值保持一致，migrate() 才会直接 return，
+  // 不去覆写本次特意传入的 level。
+  storage.set("wwp_migrated", SENTINEL.value);
 
   const sandbox = {
     document: {
@@ -133,6 +167,16 @@ function runOnce(level, dark) {
 
   let cleanup = null;
   mod.apply({ effect: (fn) => { cleanup = fn(); } });
+
+  // 回读校验：apply() 之后档位必须仍是本次传入的值。若 migrate() 因哨兵过期又跑了一遍，
+  // 这里会立刻发现「档位被覆写」，而不是等到三档数值悄悄变得一模一样。
+  const levelAfter = storage.get("wwp_surface_level");
+  if (levelAfter !== JSON.stringify(level)) {
+    throw new Error(
+      "档位被客户端覆写：预置 " + level + "，apply() 后变成 " + levelAfter +
+      "（迁移哨兵 = " + SENTINEL.value + "，来源：" + SENTINEL.source + "）"
+    );
+  }
 
   const surfaceStyle = collected.find((s) => s.getAttribute(SURFACE_ATTR) !== null);
   const mainStyle = collected.find((s) => s.getAttribute("data" + HY + "wwp") !== null);
