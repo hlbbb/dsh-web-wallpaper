@@ -309,8 +309,16 @@ function makeCtx(env, canvas) {
 			if (p === "getImageData") return function () { return { data: [] }; };
 			return function () {
 				if (p in counts) counts[p]++;
-				if (p === "arc") env.arcLog.push([arguments[0], arguments[1], arguments[2]]);
+				// 坐标日志只记「特效主画布」：粒子精灵化后改用 drawImage 绘制，而离屏精灵自身的
+				// arc/fill 也走同一个桩；若一并记入会污染断言 8/13 的「同索引粒子」位移口径。
+				const onFx = !!canvas && canvas.id === FX_ID;
+				if (p === "arc") { if (onFx) env.arcLog.push([arguments[0], arguments[1], arguments[2]]); }
 				if (p === "fillRect") env.rectLog.push([arguments[0], arguments[1], arguments[2], arguments[3]]);
+				if (p === "drawImage" && onFx) {
+					// 记录目标矩形中心（即粒子圆心）与半宽，作为 arc(x,y,r) 坐标日志的等价物
+					if (arguments.length >= 5) env.arcLog.push([arguments[1] + arguments[3] / 2, arguments[2] + arguments[4] / 2, arguments[3] / 2]);
+					else if (arguments.length >= 3) env.arcLog.push([arguments[1], arguments[2], 0]);
+				}
 				return grad;
 			};
 		},
@@ -439,7 +447,8 @@ function makeEnv(opts) {
 }
 
 const outSum = (d) => OUT_KEYS.reduce((s, k) => s + (d[k] || 0), 0);
-const coreSum = (d) => (d.fill || 0) + (d.stroke || 0) + (d.fillRect || 0);
+// 「出图调用」口径：粒子精灵化后由 drawImage 贴图，故一并计入（旧实现的 fill/stroke/fillRect 不受影响）
+const coreSum = (d) => (d.fill || 0) + (d.stroke || 0) + (d.fillRect || 0) + (d.drawImage || 0);
 
 /** 按帧边界统计相邻帧间「同索引粒子」的正向 y 位移和（用于观测 speed 效果） */
 function yDisplacement(arcLog, marks) {
@@ -641,7 +650,7 @@ addCheck("4 7 个特效逐一均有出图调用与 clearRect", function (ctx) {
 		env.tick(16.7); env.tick(16.7); env.tick(16.7); env.tick(16.7);
 		const d = env.diff(before);
 		const core = coreSum(d);
-		seen.push(id + "={fill:" + d.fill + ",stroke:" + d.stroke + ",fillRect:" + d.fillRect + ",clearRect:" + d.clearRect + "}");
+		seen.push(id + "={fill:" + d.fill + ",stroke:" + d.stroke + ",fillRect:" + d.fillRect + ",drawImage:" + d.drawImage + ",clearRect:" + d.clearRect + "}");
 		if (!(core > 0)) bad.push(id + "(出图调用 " + core + " = 0)");
 		else if (!(d.clearRect > 0)) bad.push(id + "(clearRect = 0)");
 	});
@@ -681,25 +690,31 @@ addCheck("6 强度 0.2→0.7→1.5 出图调用数单调不减（容差 20%）",
 	return { ok: true, detail: desc };
 });
 
-// 7. 大视口 + 强度 1.5：粒子数 ≤ 900（用 arc/出图调用上界观测）
-addCheck("7 3840×2160 + 强度 1.5 粒子数 ≤ 900（出图调用上界口径）", function (ctx) {
+// 7. 大视口 + 强度 1.5：粒子数 ≤ 900（粒子出图口径）
+addCheck("7 3840×2160 + 强度 1.5 粒子数 ≤ 900（粒子出图口径）", function (ctx) {
 	function run(w, h, vw, vh) {
 		const env = makeEnv({ ls: { wwp_fx: "snow", wwp_fx_intensity: 1.5 }, vw: vw, vh: vh });
 		boot(env, ctx.clientPath);
 		const before = env.snapshot();
 		env.tick(16.7); env.tick(16.7);
 		const d = env.diff(before);
-		return { arc: d.arc / 2, fill: d.fill / 2, frames: 2, d: d };
+		return { arc: d.arc / 2, fill: d.fill / 2, img: d.drawImage / 2, frames: 2, d: d };
 	}
 	const big = run(3840, 2160, 3840, 2160);
 	const small = run(1920, 1080, 1920, 1080);
-	// snow 每粒子每帧 2 次 arc + 2 次 fill → arc/2、fill/2 即粒子数观测值
+	// 粒子数观测口径：精灵化后每粒子每帧 1 次 drawImage（img 即粒子数）；
+	// 旧实现没有 drawImage，沿用原 arc/fill 上界口径（与改动前逐字一致）。
+	const spriteMode = big.img > 0;
+	const perFrame = spriteMode ? big.img : big.fill / big.frames;
+	const smallPerFrame = spriteMode ? small.img : small.fill / small.frames;
 	const arcPerFrame = big.arc / big.frames;
-	const fillPerFrame = big.fill / big.frames;
-	const ratio = fillPerFrame / (small.fill / small.frames);
+	const how = spriteMode ? "drawImage/帧" : "fill 上界口径";
+	if (!(perFrame > 0)) return { ok: false, detail: "大视口未观测到粒子出图调用（drawImage 与 fill 均为 0）" };
+	if (spriteMode && perFrame > 900) return { ok: false, detail: "大视口粒子数 " + perFrame + "（" + how + "）超过硬上限 900" };
 	if (arcPerFrame > 900 * 3) return { ok: false, detail: "大视口 arc/帧 " + arcPerFrame + " 超过保守上界 2700（=900 粒子×3 次 arc）" };
-	if (!(ratio < 2.5)) return { ok: false, detail: "面积放大 4 倍后出图数放大 " + ratio.toFixed(2) + " 倍（≥2.5），未见硬上限截断" };
-	return { ok: true, detail: "大视口 fill/帧=" + fillPerFrame + "（≈粒子 " + fillPerFrame + "）、arc/帧=" + arcPerFrame + " ≤ 2700；同参数 1920×1080 fill/帧=" + (small.fill / small.frames) + "，面积 4 倍仅放大 " + ratio.toFixed(2) + " 倍 → 已被 900 上限截断" };
+	const ratio = perFrame / smallPerFrame;
+	if (!(ratio < 2.5)) return { ok: false, detail: "面积放大 4 倍后粒子数放大 " + ratio.toFixed(2) + " 倍（≥2.5），未见硬上限截断" };
+	return { ok: true, detail: "大视口粒子/帧=" + perFrame + "（" + how + "）≤ 900、arc/帧=" + arcPerFrame + " ≤ 2700；同参数 1920×1080 粒子/帧=" + smallPerFrame + "，面积 4 倍仅放大 " + ratio.toFixed(2) + " 倍 → 已被 900 上限截断" };
 });
 
 // 8. speed 生效：同帧数下位移统计不同

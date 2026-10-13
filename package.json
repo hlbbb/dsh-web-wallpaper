@@ -1,7 +1,7 @@
 {
   "name": "dsh-web-wallpaper",
-  "version": "0.3.0",
-  "description": "DSH Web UI 壁纸插件 —— 随时更换桌面端背景：本机图片/视频(MP4 动态壁纸)/URL 导入、一键随机、定时轮换、可读性遮罩、界面面板透明化",
+  "version": "0.3.1",
+  "description": "DSH Web UI 壁纸插件 —— 随时更换桌面端背景：本机图片/视频(MP4 动态壁纸)/URL 导入、7 种动态特效、一键随机、定时轮换、可读性遮罩、界面面板透明化",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
