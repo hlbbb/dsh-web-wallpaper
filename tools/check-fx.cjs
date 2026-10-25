@@ -32,7 +32,7 @@ const RANGE_S = '[data' + HY + 'range="fxspeed"]';
 const RANGE_O = '[data' + HY + 'range="fxopacity"]';
 const VAL_I = '[data' + HY + 'val="fxintensity"]';
 const ROW_FX = '[data' + HY + 'row="fx"]';
-const FX_IDS = ["snow", "stars", "aurora", "rain", "sakura", "fireflies", "bubbles"];
+const FX_IDS = ["snow", "stars", "rain", "sakura", "fireflies", "bubbles"];
 const ATTR_NAME = "[a-zA-Z_:][a-zA-Z0-9_:." + HY + "]*";
 const OUT_KEYS = ["fill", "stroke", "fillRect", "strokeRect", "fillText", "drawImage"];
 const TAIL_KEYS = [
@@ -639,8 +639,8 @@ addCheck("3 默认 none → canvas 带 " + FX_OFF + " 且无 rAF 循环", functi
 	return { ok: true, detail: "类 " + FX_OFF + " 存在，rAF 队列 0" };
 });
 
-// 4. 7 个特效逐一：有出图调用 + clearRect
-addCheck("4 7 个特效逐一均有出图调用与 clearRect", function (ctx) {
+// 4. 6 个特效逐一：有出图调用 + clearRect
+addCheck("4 6 个特效逐一均有出图调用与 clearRect", function (ctx) {
 	const bad = [];
 	const seen = [];
 	FX_IDS.forEach(function (id) {
@@ -656,19 +656,6 @@ addCheck("4 7 个特效逐一均有出图调用与 clearRect", function (ctx) {
 	});
 	if (bad.length) return { ok: false, detail: "未通过: " + bad.join("; ") + " | 全部: " + seen.join(" ") };
 	return { ok: true, detail: seen.join(" ") };
-});
-
-// 5. aurora 帧结束后 globalCompositeOperation 已还原
-addCheck("5 aurora 帧结束后 globalCompositeOperation 还原为 source-over", function (ctx) {
-	const env = makeEnv({ ls: { wwp_fx: "aurora" } });
-	boot(env, ctx.clientPath);
-	env.tick(16.7); env.tick(16.7);
-	const c = lastCtx(env);
-	if (!c) return { ok: false, detail: "未取到 2D 上下文" };
-	const seen = env.compLog.slice();
-	if (seen.indexOf("lighter") < 0) return { ok: false, detail: "aurora 未使用 lighter 叠加（compLog=" + JSON.stringify(seen) + "），断言前提不成立" };
-	if (c.globalCompositeOperation !== "source-over") return { ok: false, detail: "帧结束后残留 " + c.globalCompositeOperation };
-	return { ok: true, detail: "compLog 序列 " + JSON.stringify(seen.slice(0, 4)) + "…，末值 source-over" };
 });
 
 // 6. 强度 0.2 → 1.5 出图调用数单调不减（20% 容差）

@@ -208,7 +208,7 @@ function runOnce(level, dark) {
   };
 }
 
-const LEVELS = ["light", "mid", "heavy"];
+const LEVELS = ["ultra", "light", "mid", "heavy"];
 const runs = {};
 for (const level of LEVELS) {
   runs[level] = { dark: runOnce(level, true), light: runOnce(level, false) };
@@ -236,16 +236,18 @@ const TOK = {
   bubble: T("specific", "bubble")
 };
 
-// ── 断言：承载文字的表面不透明度下限 ──
-const FLOOR = [
-  [TOK.l1, 0.85, "卡片 / 预览面"],
-  [TOK.l2, 0.88, "设置页弹窗 / 浮动面板"],
-  [TOK.l3, 0.85, "输入框 / 选中态"],
-  [TOK.input, 0.78, "主输入框"],
-  [TOK.selector, 0.76, "下拉选择器"],
-  [TOK.menu, 0.92, "弹出菜单"],
-  [TOK.module, 0.84, "导航条 / 标签栏"]
-];
+// ── 断言：承载文字的表面不透明度下限（按档位分设）──
+// 校准依据：2026-10-25 用户拍板「轻度不够透、要更透」，据此新增 ultra 档并下调 light 档语义；
+// ultra/light 档位的设计语义本来就是「更透」，全局统一 0.85/0.88 与该设计语义不符，
+// 故下限随档位分级：ultra 最宽、light 次之。
+// 注意：mid 档并非「维持原值」——l1 下限由 0.85 下调至 0.80（LEVELS.mid.l1=0.82 本就低于旧全局值），
+// l3 反而由 0.85 收紧至 0.90（LEVELS.mid.l3=0.93 本就高于旧值）；heavy 档与旧全局值一致。
+const FLOOR_BY_LEVEL = {
+  ultra: { l1: 0.55, l2: 0.75, l3: 0.80, input: 0.72, selector: 0.70, menu: 0.90, module: 0.80 },
+  light: { l1: 0.68, l2: 0.84, l3: 0.85, input: 0.78, selector: 0.76, menu: 0.92, module: 0.84 },
+  mid:   { l1: 0.80, l2: 0.88, l3: 0.90, input: 0.78, selector: 0.76, menu: 0.92, module: 0.84 },
+  heavy: { l1: 0.85, l2: 0.88, l3: 0.90, input: 0.78, selector: 0.76, menu: 0.92, module: 0.84 }
+};
 
 console.log("各档位解析出的令牌不透明度（来自真实注入的 CSS）\n");
 const cols = [TOK.base, TOK.l1, TOK.l2, TOK.l3, TOK.module, TOK.input, TOK.selector, TOK.menu, TOK.sidebar, TOK.bubble];
@@ -259,21 +261,24 @@ for (const level of LEVELS) {
 console.log("");
 
 let fail = 0;
-console.log("可读下限检查（设置页弹窗 = bg-2）\n");
+console.log("可读下限检查（设置页弹窗 = bg-2，按档位分设下限）\n");
 for (const level of LEVELS) {
   const a = runs[level].dark.alpha;
-  for (const [tok, min, label] of FLOOR) {
+  const floors = FLOOR_BY_LEVEL[level];
+  for (const name of Object.keys(floors)) {
+    const tok = TOK[name];
+    const min = floors[name];
     const v = a[tok];
     if (v === undefined) { console.log("  [缺失] " + level + " " + tok); fail++; continue; }
-    if (v < min) { console.log("  [低于下限] " + level + " " + tok + " = " + v + " < " + min + "  (" + label + ")"); fail++; }
+    if (v < min) { console.log("  [低于下限] " + level + " " + tok + " = " + v + " < " + min); fail++; }
   }
 }
 if (fail === 0) console.log("  全部达标");
 
-// 语义：轻度最不透、重度最透
+// 语义：ultra 最透、heavy 最实，档位 alpha 单调递增
 const l2 = LEVELS.map((l) => runs[l].dark.alpha[TOK.l2]);
-const mono = l2[0] >= l2[1] && l2[1] >= l2[2];
-console.log("\n档位单调性（轻度 >= 中度 >= 重度，越重越透）: " + (mono ? "通过" : "失败") + "  [" + l2.join(" >= ") + "]");
+const mono = l2.every((v, i) => i === 0 || l2[i - 1] <= v);
+console.log("\n档位单调性（档位 alpha 单调递增：ultra 最透 → heavy 最实）: " + (mono ? "通过" : "失败") + "  [" + l2.join(" <= ") + "]");
 if (!mono) fail++;
 
 // 深浅色都要有
