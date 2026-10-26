@@ -387,6 +387,77 @@ function makeLocalStorage(env) {
 	};
 }
 
+// ── Web Audio 最小桩（仅覆盖 lib/client.js 雨声引擎用到的 API）──
+// 记录每一个节点的 connect/start/stop 与 ctx 的 resume/suspend/close 调用，
+// 供断言 18 判定「雨声真的被拉起 / 切走后真的被挂起」。
+function makeAudioContextStub(env) {
+	const log = env.audio;
+	function connectTo(target) { log.connects++; return target; }
+	function AudioContextStub() {
+		const self = this;
+		log.created++;
+		log.instances.push(self);
+		self.state = "suspended";
+		self.currentTime = 0;
+		self.sampleRate = 44100;
+		self.destination = {};
+		self.resume = function () { log.resumes++; self.state = "running"; log.states.push("running"); return { then: function () {} }; };
+		self.suspend = function () { log.suspends++; self.state = "suspended"; log.states.push("suspended"); return { then: function () {} }; };
+		self.close = function () { log.closes++; self.state = "closed"; log.states.push("closed"); return { then: function () {} }; };
+		self.createBuffer = function (ch, len, rate) {
+			const n = Math.max(1, Number(len) || 1);
+			let arr;
+			if (typeof Float32Array === "function") arr = new Float32Array(n);
+			else { arr = []; for (var i = 0; i < n; i++) arr.push(0); }
+			const buf = {
+				length: n,
+				numberOfChannels: Number(ch) || 1,
+				sampleRate: Number(rate) || 44100,
+				getChannelData: function () { return arr; },
+			};
+			log.buffers.push(buf);
+			return buf;
+		};
+		self.createBufferSource = function () {
+			const src = {
+				buffer: null, loop: false, started: 0, stopped: 0,
+				connect: function (t) { log.sources++; return connectTo(t); },
+				disconnect: function () {},
+				start: function () { src.started++; log.starts++; },
+				stop: function () { src.stopped++; log.stops++; },
+			};
+			log.srcNodes.push(src);
+			return src;
+		};
+		self.createBiquadFilter = function () {
+			const f = {
+				type: "", frequency: { value: 0 }, Q: { value: 0 },
+				connect: function (t) { return connectTo(t); },
+				disconnect: function () {},
+			};
+			log.filters.push(f);
+			return f;
+		};
+		self.createGain = function () {
+			const g = {
+				gain: {
+					value: 1,
+					setTargetAtTime: function (v, t, c) {
+						if (!isFinite(Number(v))) log.badGain++;
+						g.gain.value = Number(v);
+						log.gainTargets.push([Number(v), Number(t), Number(c)]);
+					},
+				},
+				connect: function (t) { return connectTo(t); },
+				disconnect: function () {},
+			};
+			log.gains.push(g);
+			return g;
+		};
+	}
+	return AudioContextStub;
+}
+
 // ─────────────────────────────────────────────────────────────
 // 二、环境与模块加载
 // ─────────────────────────────────────────────────────────────
@@ -420,6 +491,14 @@ function makeEnv(opts) {
 		vw: opts.vw || 1280,
 		vh: opts.vh || 800,
 		dpr: opts.dpr === undefined ? 1 : opts.dpr,
+		noAudio: !!opts.noAudio,
+		// Web Audio 桩的调用日志（断言 18 用）
+		audio: {
+			created: 0, resumes: 0, suspends: 0, closes: 0, starts: 0, stops: 0,
+			connects: 0, sources: 0, badGain: 0,
+			instances: [], buffers: [], srcNodes: [], filters: [], gains: [],
+			gainTargets: [], states: [],
+		},
 	};
 	OUT_KEYS.concat(TAIL_KEYS).forEach(function (k) { env.draw[k] = 0; });
 	// localStorage 里存的是 JSON（源码用 JSON.parse 读），因此统一序列化
@@ -502,6 +581,8 @@ function buildSandbox(env, src, clientPath) {
 		this.abort = noop;
 	};
 	sandbox.navigator = { userAgent: "node-check", platform: "node" };
+	// Web Audio：noAudio=true 时故意不注入 AudioContext（复现「无音频环境」路径）
+	if (!env.noAudio) sandbox.AudioContext = makeAudioContextStub(env);
 	sandbox.location = { href: "http://localhost/", hostname: "localhost", protocol: "http:", search: "" };
 	sandbox.getComputedStyle = function () { return { getPropertyValue: function () { return ""; } }; };
 	sandbox.Image = function () { this.onload = null; this.onerror = null; this.src = ""; this.width = 0; this.height = 0; };
@@ -892,6 +973,141 @@ addCheck("16 #" + FX_ID + " 规则含 width:100% 与 height:100%（dpr≠1 不�
 		return { ok: false, detail: "规则缺少 " + (!hasW ? "width: 100%" : "") + (!hasW && !hasH ? " 与 " : "") + (!hasH ? "height: 100%" : "") + " —— 实测: {" + body + "}" };
 	}
 	return { ok: true, detail: "{" + body + "}" };
+});
+
+// 17. 风向 / 风力：东风（dir=0, pow=3）雪花净水平位移为正且明显大于无风基线；西风（dir=180）为负
+//     口径：与断言 8/13 同源 —— snow 每粒子每帧写一条 arc/drawImage 坐标到 env.arcLog，
+//     按帧边界对「同索引粒子」求带符号的 x 位移和；|dx| > w/2 的样本视为 wrap/换位跳变剔除。
+//     无风基线 = wwp_fx_windpow=0（风速项归零，与改前行为等价）。
+addCheck("17 风向/风力：东风雪花净水平位移为正且大于无风基线，西风为负", function (ctx) {
+	function xNet(arcLog, marks, w) {
+		let sum = 0, n = 0, prevStart = 0, prevEnd = 0;
+		for (var f = 0; f < marks.length; f++) {
+			const start = prevEnd, end = marks[f];
+			if (f > 0) {
+				const len = Math.min(end - start, prevEnd - prevStart);
+				for (var k = 0; k < len; k++) {
+					const dx = arcLog[start + k][0] - arcLog[prevStart + k][0];
+					if (Math.abs(dx) > w / 2) continue;          // 剔除 wrap（bx 越界换位）样本
+					sum += dx; n++;
+				}
+			}
+			prevStart = start;
+			prevEnd = end;
+		}
+		return { sum: sum, n: n, avg: n > 0 ? sum / n : 0 };
+	}
+	function run(dir, pow) {
+		const env = makeEnv({
+			ls: {
+				wwp_fx: "snow", wwp_fx_intensity: 1, wwp_fx_speed: 1,
+				wwp_fx_windir: dir, wwp_fx_windpow: pow,
+			},
+		});
+		boot(env, ctx.clientPath);
+		const marks = [];
+		for (var i = 0; i < 30; i++) { env.tick(16.7); marks.push(env.arcLog.length); }
+		if (env.errors.length) return { avg: 0, n: 0, sum: 0, err: env.errors[0] && env.errors[0].message };
+		return xNet(env.arcLog, marks, env.vw);
+	}
+	const base = run(0, 0);      // 无风基线：风项 = 0
+	const east = run(0, 3);      // 东风 3 级
+	const west = run(180, 3);    // 西风 3 级
+
+	const bad = [];
+	if (base.err || east.err || west.err) return { ok: false, detail: "运行期抛异常: " + (base.err || east.err || west.err) };
+	if (!(base.n > 200)) return { ok: false, detail: "基线样本仅 " + base.n + " 个，无法观测（桩局限）" };
+	if (!(east.n > 200) || !(west.n > 200)) return { ok: false, detail: "风场样本不足：东风 " + east.n + "、西风 " + west.n };
+	// 阈值口径：这是「每粒子每帧的平均净 x 位移」。snow 的六角晶体粒子在 draw 里被
+	// translate/rotate 后贴图，桩不模拟矩阵 → 其 drawImage 记录恒为 (0,0)，贡献 0 位移，
+	// 把均值按比例稀释，所以阈值取「相对无风基线」而非绝对幅度；
+	// 另加一条「东风−西风」的对称性断言，使两侧优势互相印证。
+	// 实测（连跑 8 次）：基线 -0.08~+0.05，东风 +0.78~+0.87，西风 -0.66~-0.85。
+	const TH = 0.45;
+	if (!(Math.abs(base.avg) <= 0.15)) bad.push("无风基线平均净位移 " + base.avg.toFixed(3) + "px 未贴近 0（阈值 ±0.15）");
+	if (!(east.avg > 0)) bad.push("东风平均净位移 " + east.avg.toFixed(3) + "px 不为正");
+	if (!(east.avg - base.avg >= TH)) bad.push("东风相对基线仅 +" + (east.avg - base.avg).toFixed(3) + "px（阈值 +" + TH + "），风未生效");
+	if (!(west.avg < 0)) bad.push("西风平均净位移 " + west.avg.toFixed(3) + "px 不为负");
+	if (!(base.avg - west.avg >= TH)) bad.push("西风相对基线仅 " + (base.avg - west.avg).toFixed(3) + "px（阈值 -" + TH + "），风未生效");
+	if (!(east.avg - west.avg >= TH * 2)) bad.push("东风−西风 = " + (east.avg - west.avg).toFixed(3) + "px（阈值 +" + (TH * 2) + "）—— 风向未真正反转");
+
+	const desc = "无风基线 avg=" + base.avg.toFixed(3) + "px(n=" + base.n + ")" +
+		"，东风 avg=" + east.avg.toFixed(3) + "px(n=" + east.n + ")" +
+		"，西风 avg=" + west.avg.toFixed(3) + "px(n=" + west.n + ")" +
+		"；东风−基线=+" + (east.avg - base.avg).toFixed(3) + "px，西风−基线=" + (west.avg - base.avg).toFixed(3) + "px" +
+		"；东风−西风=+" + (east.avg - west.avg).toFixed(3) + "px" +
+		"　[30 帧 × 16.7ms；正 = 向右/东，负 = 向左/西；已剔除 wrap 样本]";
+	if (bad.length) return { ok: false, detail: bad.join("；") + " —— " + desc };
+	return { ok: true, detail: desc };
+});
+
+// 18. 雨声（Web Audio 程序化合成）：三个场景
+//     ① wwp_fx="rain" + wwp_rainsfx=true → boot + 若干帧：不抛异常且 ctx.resume / source.start 被调用；
+//     ② 运行中切到 wwp_fx="snow" → ctx.suspend 被调用（切走自动挂起）；
+//     ③ 无 AudioContext 的环境（makeEnv 的 noAudio）→ 开关回退 false、noteMsg 有提示、不抛错。
+addCheck("18 雨声：rain+开关 → resume/start；切 snow → suspend；无 AudioContext → 回退且提示", function (ctx) {
+	const bad = [];
+	// ── 场景 ①：雨 + 雨声开 ──
+	const env = makeEnv({ ls: { wwp_fx: "rain", wwp_rainsfx: true, wwp_rainvol: 0.5 } });
+	let bootErr = null;
+	try { boot(env, ctx.clientPath); } catch (e) { bootErr = e; }
+	if (bootErr) return { ok: false, detail: "场景① boot 抛异常: " + (bootErr && bootErr.message) };
+	for (var i = 0; i < 6; i++) env.tick(16.7);
+	if (env.errors.length) bad.push("场景① rAF 回调抛错 " + env.errors.length + " 次: " + (env.errors[0] && env.errors[0].message));
+	const a = env.audio;
+	if (!(a.created > 0)) bad.push("场景① 未创建 AudioContext（created=0）");
+	if (!(a.resumes > 0 || a.starts > 0)) bad.push("场景① 既未 resume 也未 start（resumes=" + a.resumes + ", starts=" + a.starts + "）");
+	if (!(a.starts >= 2)) bad.push("场景① 两层 source 未全部 start（starts=" + a.starts + "，期望 ≥2）");
+	if (!(a.created === 1)) bad.push("场景① AudioContext 被重复创建 " + a.created + " 次（应为 1）");
+	// 音量：master.gain 目标值 = rainvol(0.5) × 0.6 = 0.30（公差 0.02）
+	const wantVol = 0.5 * 0.6;
+	const hasVol = a.gainTargets.some(function (g) { return Math.abs(g[0] - wantVol) <= 0.02; });
+	if (!hasVol) bad.push("场景① master.gain 未见目标值 ≈" + wantVol.toFixed(2) + "（实际 " + JSON.stringify(a.gainTargets.map(function (g) { return g[0]; })) + "）");
+	if (a.badGain > 0) bad.push("场景① setTargetAtTime 收到非有限值 " + a.badGain + " 次");
+	const s1 = { created: a.created, resumes: a.resumes, starts: a.starts, suspends: a.suspends };
+
+	// ── 场景 ②：切到 snow → 应 suspend ──
+	const selFxEl = env.document.querySelector(SEL_FX);
+	if (!selFxEl) return { ok: false, detail: "未找到面板控件 " + SEL_FX };
+	const suspBefore = a.suspends;
+	selFxEl.value = "snow";
+	selFxEl.trigger("change");
+	env.tick(16.7);
+	if (env.errors.length) bad.push("场景② 切换后 rAF 回调抛错 " + env.errors.length + " 次");
+	if (!(a.suspends > suspBefore)) bad.push("场景② 切到 snow 后 ctx.suspend 未被调用（suspends " + suspBefore + "→" + a.suspends + "）");
+	if (a.created !== 1) bad.push("场景② 切换特效后 AudioContext 被重建（created=" + a.created + "，应保持 1）");
+	// 切回 rain → 应重新 resume（不重复创建）
+	const resBefore2 = a.resumes;
+	selFxEl.value = "rain";
+	selFxEl.trigger("change");
+	env.tick(16.7);
+	if (!(a.resumes > resBefore2)) bad.push("场景② 切回 rain 后未 resume（resumes " + resBefore2 + "→" + a.resumes + "）");
+	if (a.created !== 1) bad.push("场景② 切回 rain 后 AudioContext 被重建（created=" + a.created + "）");
+	const s2 = { suspends: a.suspends - suspBefore, resumes: a.resumes - resBefore2 };
+
+	// ── 场景 ③：无 AudioContext 环境 ──
+	const env2 = makeEnv({ ls: { wwp_fx: "rain", wwp_rainsfx: true }, noAudio: true });
+	let err3 = null;
+	try { boot(env2, ctx.clientPath); } catch (e) { err3 = e; }
+	if (err3) return { ok: false, detail: "场景③ boot 抛异常: " + (err3 && err3.message) };
+	env2.tick(16.7);
+	if (env2.errors.length) bad.push("场景③ rAF 回调抛错 " + env2.errors.length + " 次: " + (env2.errors[0] && env2.errors[0].message));
+	const noteEl = env2.document.querySelector("[data-note]");
+	const noteText = noteEl ? String(noteEl.textContent || "") : "";
+	if (!/不支持音频/.test(noteText)) bad.push("场景③ noteMsg 未给出音频不支持提示（实际 \"" + noteText + "\"）");
+	const rawStore = env2.store.get("wwp_rainsfx");
+	if (rawStore !== JSON.stringify(false)) bad.push("场景③ 开关未回退为 false（localStorage wwp_rainsfx=" + rawStore + "）");
+	const chkEl = env2.document.querySelector('[data-chk="rainsfx"]');
+	if (chkEl && chkEl.checked) bad.push("场景③ 面板复选框仍为勾选态（未回填回退值）");
+
+	if (bad.length) return { ok: false, detail: bad.join("；") };
+	return {
+		ok: true,
+		detail: "① rain+开关 → AudioContext×" + s1.created + "、resume " + s1.resumes + " 次、两层 source start " +
+			s1.starts + " 次、master.gain 目标含 " + wantVol.toFixed(2) + "；② 切 snow → suspend " + s2.suspends +
+			" 次生效、切回 rain 重新 resume " + s2.resumes + " 次且 ctx 未重建（累计 " + a.created + "）；" +
+			"③ 无 AudioContext → 提示「" + noteText + "」、localStorage 开关回退 false、不抛错",
+	};
 });
 
 // ─────────────────────────────────────────────────────────────

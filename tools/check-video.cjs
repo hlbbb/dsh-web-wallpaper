@@ -1402,8 +1402,16 @@ function checkAll() {
     if (e5.errors.length) d.push("执行期间抛错 " + e5.errors.length + " 次: " + e5.errors.map(function (x) { return x.message; }).join(" / "));
     var bg = e5.document.getElementById(ID_BG);
     if (!bg) d.push("未找到 #" + ID_BG + " 元素（apply 未跑完）");
-    else if (!bg._classes.has(HIDDEN_CLASS)) d.push("IndexedDB 不可用时应走隐藏路径（缺 class " + HIDDEN_CLASS + "），实际 class: " + JSON.stringify(Array.from(bg._classes)));
-    report(10, "indexedDB / FileReader 缺失时不抛异常（双向兼容既有环境）", d.length === 0, d);
+    // v4 起语义变更：启用中但无壁纸（本场景即无 currentId）→ 不再隐藏，而是显示
+    // 纯色底衬（wwp-on 挂上、无 wwp-hidden），盖住主题自带的点阵底纹；
+    // 只有「停用」才走真正的隐藏路径。此处的核心断言是「不抛异常 + 状态自洽」。
+    else {
+      var hasOn = e5.document.documentElement._classes.has("wwp" + HY + "on");
+      var isHidden = bg._classes.has(HIDDEN_CLASS);
+      if (!hasOn && !isHidden) d.push("既未挂 wwp-on 也未隐藏（状态不自洽），实际 class: " + JSON.stringify(Array.from(bg._classes)));
+      d.push("[信息] 底衬路径: wwp-on=" + hasOn + " hidden=" + isHidden + " bg=" + JSON.stringify(bg.style.backgroundColor));
+    }
+    report(10, "indexedDB / FileReader 缺失时不抛异常（双向兼容既有环境）", d.filter(function (x) { return x.indexOf("[信息]") !== 0; }).length === 0, d);
   })();
 
   // ── 11. URL 视频能拿到 poster（核心回归门，守住 P1）──
